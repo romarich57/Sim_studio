@@ -475,8 +475,12 @@ export async function POST(req: NextRequest) {
     } catch { }
 
 
+
     // Special handling for Local Ollama to bypass external Sim Agent
-    if (env.COPILOT_PROVIDER === 'ollama') {
+    // We check env.COPILOT_PROVIDER OR if the client requested 'ollama'
+    // This allows forcing ollama even if the client sent 'anthropic' or 'openai' (e.g. from model selector aliases)
+    if (env.COPILOT_PROVIDER === 'ollama' || provider === 'ollama') {
+
       try {
         logger.info(`[${tracker.requestId}] executing local ollama request`)
 
