@@ -9,6 +9,7 @@ import { generateChatTitle } from '@/lib/copilot/chat-title'
 import { getCopilotModel } from '@/lib/copilot/config'
 import { SIM_AGENT_API_URL_DEFAULT, SIM_AGENT_VERSION } from '@/lib/copilot/constants'
 import { COPILOT_MODEL_IDS, COPILOT_REQUEST_MODES } from '@/lib/copilot/models'
+import { executeProviderRequest } from '@/providers'
 import {
   authenticateCopilotRequestSessionOnly,
   createBadRequestResponse,
@@ -121,15 +122,15 @@ export async function POST(req: NextRequest) {
         contextsCount: Array.isArray(contexts) ? contexts.length : 0,
         contextsPreview: Array.isArray(contexts)
           ? contexts.map((c: any) => ({
-              kind: c?.kind,
-              chatId: c?.chatId,
-              workflowId: c?.workflowId,
-              executionId: (c as any)?.executionId,
-              label: c?.label,
-            }))
+            kind: c?.kind,
+            chatId: c?.chatId,
+            workflowId: c?.workflowId,
+            executionId: (c as any)?.executionId,
+            label: c?.label,
+          }))
           : undefined,
       })
-    } catch {}
+    } catch { }
     // Preprocess contexts server-side
     let agentContexts: Array<{ type: string; content: string }> = []
     if (Array.isArray(contexts) && contexts.length > 0) {
@@ -471,7 +472,93 @@ export async function POST(req: NextRequest) {
         baseToolCount: baseTools.length,
         hasCredentials: !!credentials,
       })
-    } catch {}
+    } catch { }
+
+
+    // Special handling for Local Ollama to bypass external Sim Agent
+    if (env.COPILOT_PROVIDER === 'ollama') {
+      try {
+        logger.info(`[${tracker.requestId}] executing local ollama request`)
+
+        // Flatten messages for Ollama (it prefers strings for content usually, but we'll try to keep structure if possible)
+        // But provider request expects 'messages' in a specific format
+        const providerMessages = messages.map(m => ({
+          role: m.role,
+          content: Array.isArray(m.content)
+            ? m.content.map((c: any) => c.text || '').join('\n')
+            : m.content
+        }))
+
+        // Merge tools
+        const requestTools = [...(integrationTools || []), ...(baseTools || [])].map(t => ({
+          id: t.name,
+          description: t.description,
+          parameters: t.input_schema,
+          usageControl: 'auto'
+        })) as any[]
+
+        const response = await executeProviderRequest('ollama', {
+          model: selectedModel,
+          messages: providerMessages,
+          tools: requestTools.length > 0 ? requestTools : undefined,
+          stream: true,
+          // Contexts are already "processed" into agentContexts which are strings
+          // We can prepend them to the last user message or system prompt
+          systemPrompt: agentContexts.map(c => c.content).join('\n\n'),
+        })
+
+        if (response && typeof response === 'object' && 'stream' in response && 'execution' in response) {
+          const streamingExec = response as any
+          const stream = streamingExec.stream
+
+          const encoder = new TextEncoder()
+          const transformStream = new TransformStream({
+            start(controller) {
+              if (actualChatId) {
+                const chatIdEvent = {
+                  type: 'chat_id',
+                  chatId: actualChatId
+                }
+                const encoded = encoder.encode(`data: ${JSON.stringify(chatIdEvent)}\n\n`)
+                controller.enqueue(encoded)
+              }
+            },
+            async transform(chunk, controller) {
+              // Chunk is text content from ollama provider stream
+              if (typeof chunk === 'string') {
+                const event = {
+                  type: 'content',
+                  data: chunk
+                }
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`))
+              }
+            },
+            flush(controller) {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`))
+            }
+          })
+
+          const sseStream = stream.pipeThrough(transformStream)
+
+          return new Response(sseStream, {
+            headers: {
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              'Connection': 'keep-alive',
+            }
+          })
+        }
+
+        throw new Error('Ollama did not return a stream')
+
+      } catch (error) {
+        logger.error(`[${tracker.requestId}] Local Ollama error:`, error)
+        return NextResponse.json(
+          { error: error instanceof Error ? error.message : String(error) },
+          { status: 500 }
+        )
+      }
+    }
 
     const simAgentResponse = await fetch(`${SIM_AGENT_API_URL}/api/chat-completion-streaming`, {
       method: 'POST',
@@ -512,8 +599,8 @@ export async function POST(req: NextRequest) {
         ...(Array.isArray(contexts) && contexts.length > 0 && { contexts }),
         ...(Array.isArray(contexts) &&
           contexts.length > 0 && {
-            contentBlocks: [{ type: 'contexts', contexts: contexts as any, timestamp: Date.now() }],
-          }),
+          contentBlocks: [{ type: 'contexts', contexts: contexts as any, timestamp: Date.now() }],
+        }),
       }
 
       // Create a pass-through stream that captures the response
@@ -711,7 +798,7 @@ export async function POST(req: NextRequest) {
                           reader.cancel()
                           break
                         }
-                      } catch {}
+                      } catch { }
                       // Do not forward the original error event
                     } else {
                       // Forward original event to client
@@ -915,8 +1002,8 @@ export async function POST(req: NextRequest) {
         ...(Array.isArray(contexts) && contexts.length > 0 && { contexts }),
         ...(Array.isArray(contexts) &&
           contexts.length > 0 && {
-            contentBlocks: [{ type: 'contexts', contexts: contexts as any, timestamp: Date.now() }],
-          }),
+          contentBlocks: [{ type: 'contexts', contexts: contexts as any, timestamp: Date.now() }],
+        }),
       }
 
       const assistantMessage = {

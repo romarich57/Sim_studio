@@ -1,9 +1,11 @@
 services:
   simstudio:
-    image: ghcr.io/simstudioai/simstudio:latest
+    build:
+      context: .
+      dockerfile: docker/app.Dockerfile
     restart: unless-stopped
     ports:
-      - '3000:3000'
+      - '${PORT:-3000}:3000'
     deploy:
       resources:
         limits:
@@ -23,6 +25,9 @@ services:
       - OLLAMA_URL=${OLLAMA_URL:-http://localhost:11434}
       - SOCKET_SERVER_URL=${SOCKET_SERVER_URL:-http://realtime:3002}
       - NEXT_PUBLIC_SOCKET_URL=${NEXT_PUBLIC_SOCKET_URL:-http://localhost:3002}
+    networks:
+      - default
+      - n8n_net
     depends_on:
       db:
         condition: service_healthy
@@ -31,7 +36,7 @@ services:
       realtime:
         condition: service_healthy
     healthcheck:
-      test: ['CMD', 'wget', '--spider', '--quiet', 'http://127.0.0.1:3000']
+      test: [ 'CMD', 'wget', '--spider', '--quiet', 'http://127.0.0.1:3000' ]
       interval: 90s
       timeout: 5s
       retries: 3
@@ -41,7 +46,7 @@ services:
     image: ghcr.io/simstudioai/realtime:latest
     restart: unless-stopped
     ports:
-      - '3002:3002'
+      - '${SOCKET_PORT:-3002}:3002'
     deploy:
       resources:
         limits:
@@ -58,7 +63,7 @@ services:
       db:
         condition: service_healthy
     healthcheck:
-      test: ['CMD', 'wget', '--spider', '--quiet', 'http://127.0.0.1:3002/health']
+      test: [ 'CMD', 'wget', '--spider', '--quiet', 'http://127.0.0.1:3002/health' ]
       interval: 90s
       timeout: 5s
       retries: 3
@@ -72,7 +77,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    command: ['bun', 'run', 'db:migrate']
+    command: [ 'bun', 'run', 'db:migrate' ]
     restart: 'no'
 
   db:
@@ -87,10 +92,15 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      test: [ 'CMD-SHELL', 'pg_isready -U postgres' ]
       interval: 5s
       timeout: 5s
       retries: 5
 
 volumes:
   postgres_data:
+
+
+networks:
+  n8n_net:
+    external: true

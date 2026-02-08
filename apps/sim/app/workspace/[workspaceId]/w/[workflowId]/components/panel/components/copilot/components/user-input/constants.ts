@@ -252,6 +252,7 @@ export const MODEL_OPTIONS = [
   { value: 'gpt-5.2-codex', label: 'GPT 5.2 Codex' },
   { value: 'gpt-5.2-pro', label: 'GPT 5.2 Pro' },
   { value: 'gemini-3-pro', label: 'Gemini 3 Pro' },
+  { value: 'qwen2.5:3b-instruct', label: 'Ollama (Qwen 2.5 3B)' },
 ] as const
 
 /**
