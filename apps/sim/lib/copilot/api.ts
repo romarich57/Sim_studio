@@ -1,5 +1,6 @@
 import { createLogger } from '@sim/logger'
 import type { CopilotMode, CopilotModelId, CopilotTransportMode } from '@/lib/copilot/models'
+import { getProviderFromModel } from '@/providers/utils'
 
 const logger = createLogger('CopilotAPI')
 
@@ -68,6 +69,7 @@ export interface SendMessageRequest {
   workflowId?: string
   mode?: CopilotMode | CopilotTransportMode
   model?: CopilotModelId
+  provider?: string
   prefetch?: boolean
   createNewChat?: boolean
   stream?: boolean
@@ -121,9 +123,15 @@ export async function sendStreamingMessage(
 ): Promise<StreamingResponse> {
   try {
     const { abortSignal, ...requestBody } = request
+    const payload = { ...requestBody }
+    if (!payload.provider && payload.model) {
+      try {
+        payload.provider = getProviderFromModel(payload.model)
+      } catch {}
+    }
     try {
-      const preview = Array.isArray((requestBody as any).contexts)
-        ? (requestBody as any).contexts.map((c: any) => ({
+      const preview = Array.isArray((payload as any).contexts)
+        ? (payload as any).contexts.map((c: any) => ({
             kind: c?.kind,
             chatId: c?.chatId,
             workflowId: c?.workflowId,
@@ -131,9 +139,9 @@ export async function sendStreamingMessage(
           }))
         : undefined
       logger.info('Preparing to send streaming message', {
-        hasContexts: Array.isArray((requestBody as any).contexts),
-        contextsCount: Array.isArray((requestBody as any).contexts)
-          ? (requestBody as any).contexts.length
+        hasContexts: Array.isArray((payload as any).contexts),
+        contextsCount: Array.isArray((payload as any).contexts)
+          ? (payload as any).contexts.length
           : 0,
         contextsPreview: preview,
       })
@@ -141,7 +149,7 @@ export async function sendStreamingMessage(
     const response = await fetch('/api/copilot/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...requestBody, stream: true }),
+      body: JSON.stringify({ ...payload, stream: true }),
       signal: abortSignal,
       credentials: 'include', // Include cookies for session authentication
     })

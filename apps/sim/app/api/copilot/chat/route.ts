@@ -8,8 +8,9 @@ import { getSession } from '@/lib/auth'
 import { generateChatTitle } from '@/lib/copilot/chat-title'
 import { getCopilotModel } from '@/lib/copilot/config'
 import { SIM_AGENT_API_URL_DEFAULT, SIM_AGENT_VERSION } from '@/lib/copilot/constants'
-import { COPILOT_MODEL_IDS, COPILOT_REQUEST_MODES } from '@/lib/copilot/models'
+import { COPILOT_REQUEST_MODES } from '@/lib/copilot/models'
 import { executeProviderRequest } from '@/providers'
+import { getProviderFromModel } from '@/providers/utils'
 import {
   authenticateCopilotRequestSessionOnly,
   createBadRequestResponse,
@@ -49,7 +50,7 @@ const ChatMessageSchema = z.object({
   stream: z.boolean().optional().default(true),
   implicitFeedback: z.string().optional(),
   fileAttachments: z.array(FileAttachmentSchema).optional(),
-  provider: z.string().optional().default('openai'),
+  provider: z.string().optional(),
   conversationId: z.string().optional(),
   contexts: z
     .array(
@@ -276,9 +277,21 @@ export async function POST(req: NextRequest) {
 
     let providerConfig: CopilotProviderConfig | undefined
     const providerEnv = env.COPILOT_PROVIDER as any
+    let inferredProvider: string | null = null
+    try {
+      inferredProvider = getProviderFromModel(selectedModel)
+    } catch (error) {
+      logger.warn(`[${tracker.requestId}] Failed to infer provider from model`, {
+        model: selectedModel,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
 
-    if (providerEnv) {
-      if (providerEnv === 'azure-openai') {
+    // Client-provided provider (when present) takes precedence; otherwise infer from model.
+    const effectiveProvider = provider || inferredProvider || providerEnv || defaults.provider
+
+    if (effectiveProvider) {
+      if (effectiveProvider === 'azure-openai') {
         providerConfig = {
           provider: 'azure-openai',
           model: envModel,
@@ -286,7 +299,7 @@ export async function POST(req: NextRequest) {
           apiVersion: 'preview',
           endpoint: env.AZURE_OPENAI_ENDPOINT,
         }
-      } else if (providerEnv === 'azure-anthropic') {
+      } else if (effectiveProvider === 'azure-anthropic') {
         providerConfig = {
           provider: 'azure-anthropic',
           model: envModel,
@@ -294,7 +307,7 @@ export async function POST(req: NextRequest) {
           apiVersion: env.AZURE_ANTHROPIC_API_VERSION,
           endpoint: env.AZURE_ANTHROPIC_ENDPOINT,
         }
-      } else if (providerEnv === 'vertex') {
+      } else if (effectiveProvider === 'vertex') {
         providerConfig = {
           provider: 'vertex',
           model: envModel,
@@ -304,7 +317,7 @@ export async function POST(req: NextRequest) {
         }
       } else {
         providerConfig = {
-          provider: providerEnv,
+          provider: effectiveProvider as CopilotProviderConfig['provider'],
           model: selectedModel,
           apiKey: env.COPILOT_API_KEY,
         }
@@ -477,12 +490,17 @@ export async function POST(req: NextRequest) {
 
 
     // Special handling for Local Ollama to bypass external Sim Agent
-    // We check env.COPILOT_PROVIDER OR if the client requested 'ollama'
-    // This allows forcing ollama even if the client sent 'anthropic' or 'openai' (e.g. from model selector aliases)
-    if (env.COPILOT_PROVIDER === 'ollama' || provider === 'ollama') {
+    // Route ollama models locally to bypass external Sim Agent authentication.
+    if (effectiveProvider === 'ollama') {
 
       try {
-        logger.info(`[${tracker.requestId}] executing local ollama request`)
+        logger.info(`[${tracker.requestId}] executing local ollama request`, {
+          model: selectedModel,
+          provider,
+          inferredProvider,
+          providerEnv,
+          effectiveProvider,
+        })
 
         // Flatten messages for Ollama (it prefers strings for content usually, but we'll try to keep structure if possible)
         // But provider request expects 'messages' in a specific format
@@ -511,11 +529,14 @@ export async function POST(req: NextRequest) {
           systemPrompt: agentContexts.map(c => c.content).join('\n\n'),
         })
 
+        const encoder = new TextEncoder()
+        const decoder = new TextDecoder()
+
+        // Streamed provider response (StreamingExecution)
         if (response && typeof response === 'object' && 'stream' in response && 'execution' in response) {
           const streamingExec = response as any
           const stream = streamingExec.stream
 
-          const encoder = new TextEncoder()
           const transformStream = new TransformStream({
             start(controller) {
               if (actualChatId) {
@@ -528,16 +549,30 @@ export async function POST(req: NextRequest) {
               }
             },
             async transform(chunk, controller) {
-              // Chunk is text content from ollama provider stream
+              let textChunk = ''
               if (typeof chunk === 'string') {
+                textChunk = chunk
+              } else if (chunk instanceof Uint8Array) {
+                textChunk = decoder.decode(chunk, { stream: true })
+              } else if (chunk instanceof ArrayBuffer) {
+                textChunk = decoder.decode(new Uint8Array(chunk), { stream: true })
+              }
+
+              if (textChunk) {
                 const event = {
                   type: 'content',
-                  data: chunk
+                  data: textChunk
                 }
                 controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`))
               }
             },
             flush(controller) {
+              const remaining = decoder.decode()
+              if (remaining) {
+                controller.enqueue(
+                  encoder.encode(`data: ${JSON.stringify({ type: 'content', data: remaining })}\n\n`)
+                )
+              }
               controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`))
             }
           })
@@ -553,7 +588,37 @@ export async function POST(req: NextRequest) {
           })
         }
 
-        throw new Error('Ollama did not return a stream')
+        // Non-stream provider response (can happen with tool loops). Return as SSE for UI compatibility.
+        if (response && typeof response === 'object' && 'content' in response) {
+          const content =
+            typeof (response as any).content === 'string' ? (response as any).content : ''
+          const sseStream = new ReadableStream({
+            start(controller) {
+              if (actualChatId) {
+                controller.enqueue(
+                  encoder.encode(`data: ${JSON.stringify({ type: 'chat_id', chatId: actualChatId })}\n\n`)
+                )
+              }
+              if (content) {
+                controller.enqueue(
+                  encoder.encode(`data: ${JSON.stringify({ type: 'content', data: content })}\n\n`)
+                )
+              }
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: 'done' })}\n\n`))
+              controller.close()
+            },
+          })
+
+          return new Response(sseStream, {
+            headers: {
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              'Connection': 'keep-alive',
+            },
+          })
+        }
+
+        throw new Error('Ollama response shape is not supported')
 
       } catch (error) {
         logger.error(`[${tracker.requestId}] Local Ollama error:`, error)
